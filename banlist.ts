@@ -6,7 +6,7 @@
 //   npx tsx banlist.ts --confirm  -> bans for real
 
 import "dotenv/config";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const API = "https://discord.com/api/v10";
 const BATCH_SIZE = 200; // Discord bulk-ban max per request
@@ -23,6 +23,9 @@ const PROTECTED_IDS = new Set(
   (process.env.PROTECTED_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
 );
 const CONFIRM = process.argv.includes("--confirm");
+const SKIP_DELETED = (process.env.SKIP_DELETED ?? "true").toLowerCase() !== "false";
+const CHECK_CONCURRENCY = 10; // parallel user lookups; rate limits are handled by the 429 retry
+const CHECK_CACHE_FILE = "user-check-cache.json"; // lets a re-run skip users already checked
 
 function need(name: string): string {
   const v = process.env[name];
@@ -127,6 +130,51 @@ async function fetchAllByUserId(endpoint: string): Promise<Map<string, any>> {
   return entries;
 }
 
+// Discord has no official "deleted" flag. Deleted accounts get a placeholder name
+// (deleted_user_xxxxxxxx, or "Deleted User xxxxxxxx" on older accounts); a 404 means the ID doesn't exist.
+type CheckResult = "ok" | "deleted" | "missing";
+
+async function checkUser(id: string): Promise<CheckResult> {
+  try {
+    const u = await discord(`/users/${id}`);
+    const name = String(u?.username ?? "");
+    return /^deleted_user_[0-9a-f]+$/i.test(name) || /^deleted user/i.test(name) ? "deleted" : "ok";
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("-> 404")) return "missing";
+    throw e;
+  }
+}
+
+async function filterDeleted(ids: string[]): Promise<{ live: string[]; deleted: string[]; missing: string[] }> {
+  const cache: Record<string, CheckResult> = existsSync(CHECK_CACHE_FILE)
+    ? JSON.parse(readFileSync(CHECK_CACHE_FILE, "utf8"))
+    : {};
+  const todo = ids.filter((id) => !cache[id]);
+  console.log(`\nChecking for deleted accounts: ${ids.length - todo.length} cached, ${todo.length} to look up...`);
+
+  let done = 0;
+  let next = 0;
+  const save = () => writeFileSync(CHECK_CACHE_FILE, JSON.stringify(cache));
+  const worker = async () => {
+    while (next < todo.length) {
+      const id = todo[next++];
+      cache[id] = await checkUser(id);
+      if (++done % 500 === 0) {
+        save();
+        console.log(`   checked ${done}/${todo.length}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: CHECK_CONCURRENCY }, worker));
+  save();
+
+  return {
+    live: ids.filter((id) => cache[id] === "ok"),
+    deleted: ids.filter((id) => cache[id] === "deleted"),
+    missing: ids.filter((id) => cache[id] === "missing"),
+  };
+}
+
 function csvCell(v: unknown): string {
   const s = String(v ?? "");
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -195,7 +243,21 @@ async function main() {
 
   // 6. Skip people already banned
   const alreadyBanned = await fetchAllByUserId(`/guilds/${GUILD_ID}/bans`);
-  const toBan = [...ids].filter((id) => !alreadyBanned.has(id));
+  const notBanned = [...ids].filter((id) => !alreadyBanned.has(id));
+
+  // 7. Skip deleted / nonexistent accounts
+  let toBan = notBanned;
+  let deleted: string[] = [];
+  let missing: string[] = [];
+  if (SKIP_DELETED) {
+    ({ live: toBan, deleted, missing } = await filterDeleted(notBanned));
+    if (deleted.length || missing.length) {
+      writeFileSync(
+        "deleted-accounts.txt",
+        [...deleted.map((id) => `${id}\tdeleted`), ...missing.map((id) => `${id}\tnot found`)].join("\n") + "\n",
+      );
+    }
+  }
 
   console.log(`\nServer: ${guild.name}`);
   console.log(`IDs in sheet:                 ${totalInSheet}`);
@@ -206,7 +268,10 @@ async function main() {
     console.log(`   ${m.user.username} (${id}) — ${serverCount.get(id)} servers: ${serverList.get(id)}`);
   }
   if (flagged.length > 15) console.log(`   ...and ${flagged.length - 15} more in ${LOG_FILE}`);
-  console.log(`Already banned:               ${ids.size - toBan.length}`);
+  console.log(`Already banned:               ${ids.size - notBanned.length}`);
+  if (SKIP_DELETED) {
+    console.log(`Deleted / not found (skip):   ${deleted.length + missing.length}${deleted.length + missing.length ? "  -> deleted-accounts.txt" : ""}`);
+  }
   console.log(`To ban:                       ${toBan.length}`);
 
   if (!CONFIRM) {
@@ -214,7 +279,7 @@ async function main() {
     return;
   }
 
-  // 7. Bulk ban in batches of 200
+  // 8. Bulk ban in batches of 200
   let banned = 0;
   const failed: string[] = [];
   for (let i = 0; i < toBan.length; i += BATCH_SIZE) {
